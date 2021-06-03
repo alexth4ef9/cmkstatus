@@ -1,0 +1,11 @@
+[Unit]
+Description=Check_MK status display
+After=omd.service
+Wants=omd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/checkmk-status <site> /dev/serial/by-id/usb-Adafruit_Feather_M0_<serial>
+
+[Install]
+WantedBy=multi-user.target

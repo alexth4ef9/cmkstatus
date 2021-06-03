@@ -1,0 +1,264 @@
+#!/usr/bin/python3
+# SPDX-FileCopyrightText: 2020-2021, Alexander Thulcke
+# SPDX-License-Identifier: MIT
+
+from socket import socket, AF_UNIX, SOCK_STREAM, SHUT_WR
+import json
+from serial import Serial, SerialException, SerialTimeoutException
+from os import path
+from signal import signal, SIGTERM
+from argparse import ArgumentParser
+from time import time, sleep
+import sys
+import logging
+
+args = None
+logger = None
+
+
+class Status:
+    def __init__(self, site):
+        self.site = site
+        self.query = '''GET services
+Stats: state = 0
+Stats: state = 1
+Stats: scheduled_downtime_depth = 0
+StatsAnd: 2
+Stats: state = 2
+Stats: scheduled_downtime_depth = 0
+StatsAnd: 2
+Stats: state = 3
+Stats: scheduled_downtime_depth = 0
+StatsAnd: 2
+Stats: scheduled_downtime_depth > 0
+ColumnHeaders: on
+OutputFormat: json
+'''.encode('utf-8')
+
+    def read(self):
+        address = '/omd/sites/{0}/tmp/run/live'.format(self.site)
+        try:
+            with socket(AF_UNIX, SOCK_STREAM) as sock:
+                sock.connect(address)
+                sock.send(self.query)
+                sock.shutdown(SHUT_WR)
+                rawdata = sock.makefile().read()
+        except Exception:
+            logger.exception('failed to get live status')
+            return []
+        if rawdata:
+            data = json.loads(rawdata)
+            return [dict(zip(data[0], value)) for value in data[1:]]
+        return []
+
+
+class Display:
+    def __init__(self, port, baudrate, direction='top', rows=8, columns=4, brightness=10):
+        self._rows = rows
+        self._columns = columns
+        self.brightness = brightness
+        self._colourmapping = {
+            -1: [0x00, 0x00, 0x00],
+            0: [0x00, 0xff, 0x00],
+            1: [0xff, 0xff, 0x00],
+            2: [0xff, 0x00, 0x00],
+            3: [0xff, 0x60, 0x00],
+            4: [0x00, 0xa0, 0xff],
+        }
+        if direction == 'top':
+            self._mapping = [[row + rows * col for col in range(columns - 1, -1, -1)] for row in range(rows)]
+        else:
+            self._mapping = [[row + rows * col for col in range(columns)] for row in range(rows - 1, -1, -1)]
+        self._pixels = [-1] * (rows * columns)
+        self._serial = Serial()
+        self._serial.port = port
+        self._serial.baudrate = baudrate
+        self._serial.timeout = 0.1
+        self._serial.write_timeout = 0.1
+
+    def __del__(self):
+        try:
+            if self._serial.is_open:
+                self._serial.close()
+        except SerialException:
+            pass
+
+    def _open(self):
+        try:
+            if not path.exists(self._serial.port):
+                return
+            if not self._serial.is_open:
+                self._serial.open()
+            self._send('update 0')
+        except SerialException:
+            logger.exception('failed to open serial port')
+
+    def _send(self, command):
+        try:
+            if self._serial.is_open:
+                logger.debug('send: "{0}"'.format(command))
+                self._serial.write((command + '\n').encode('utf-8'))
+                reply = self._serial.read_until(size=80).decode('utf-8').strip()
+                logger.debug('recv: "{0}"'.format(reply))
+        except (UnicodeDecodeError, SerialTimeoutException):
+            pass
+        except SerialException:
+            logger.exception('failed to send command')
+
+    def _update(self):
+        self._open()
+        for i, v in enumerate(self._pixels):
+            self._send('set {0} {1} {2} {3}'.format(i,
+                                                    self.brightness * self._colourmapping[v][0] // 255,
+                                                    self.brightness * self._colourmapping[v][1] // 255,
+                                                    self.brightness * self._colourmapping[v][2] // 255))
+        self._send('show')
+
+    def update_status(self, status):
+        if len(status) == 0:
+            return
+        logger.debug('updating status')
+        if status['crit'] > 0:
+            s = 2
+        elif status['warn'] > 0:
+            s = 1
+        elif status['unkn'] > 0:
+            s = 3
+        elif status['down'] > 0:
+            s = 4
+        else:
+            s = 0
+        for i in range(self._columns):
+            self._pixels[self._mapping[0][i]] = s
+        self._update()
+
+    def update_history(self, status):
+        if len(status) == 0:
+            return
+        logger.debug('updating history')
+        for i in range(self._rows - 1, 0, -1):
+            for j in range(self._columns):
+                self._pixels[self._mapping[i][j]] = self._pixels[self._mapping[i - 1][j]]
+        self._pixels[self._mapping[1][0]] = 2 if status['crit'] > 0 else 0
+        self._pixels[self._mapping[1][1]] = 1 if status['warn'] > 0 else -1
+        self._pixels[self._mapping[1][2]] = 3 if status['unkn'] > 0 else -1
+        self._pixels[self._mapping[1][3]] = 4 if status['down'] > 0 else -1
+        self._update()
+
+
+def parse_args():
+    global args, logger
+
+    parser = ArgumentParser(description='checkmk live status service')
+    default_baudrate = 4000000
+    default_direction = 'top'
+
+    parser.add_argument(
+        '-b', '--baudrate',
+        help='baud rate (default: {0})'.format(default_baudrate),
+        type=int, default=default_baudrate)
+    parser.add_argument(
+        '-d', '--direction',
+        help='display direction (default: {0})'.format(default_direction),
+        choices=['top', 'down'], default=default_direction)
+    parser.add_argument(
+        '-v', '--verbose',
+        help='increase verbosity',
+        action='count', default=0)
+    parser.add_argument(
+        '-s', '--shortlog',
+        help='log only level and message',
+        action='store_true')
+    parser.add_argument(
+        'site', nargs=1,
+        help='check_mk site')
+    parser.add_argument(
+        'port', nargs=1,
+        help='serial port')
+
+    args = parser.parse_args()
+
+    if args.verbose == 1:
+        log_level = logging.INFO
+    elif args.verbose > 1:
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.WARNING
+
+    if args.shortlog:
+        fmt = '%(levelname)s: %(message)s'
+    else:
+        fmt = ('%(asctime)s:%(name)s %(levelname)s(pid %(process)d): '
+               '%(message)s')
+
+    logging.basicConfig(level=log_level, format=fmt)
+    logger = logging.getLogger('checkmk-status')
+
+
+def map_result(status):
+    if len(status) > 0:
+        return {
+            'ok': status[0]['stats_1'],
+            'warn': status[0]['stats_2'],
+            'crit': status[0]['stats_3'],
+            'unkn': status[0]['stats_4'],
+            'down': status[0]['stats_5'],
+        }
+    return {}
+
+
+def sigterm_handler(signum, frame):
+    if signum == SIGTERM:
+        logger.info('received SIGTERM, tearing down')
+        # implictely raise SystemExit to cleanup properly
+        sys.exit(0)
+
+
+def main():
+    parse_args()
+
+    status = Status(args.site[0])
+    display = Display(args.port[0], args.baudrate, direction=args.direction)
+
+    signal(SIGTERM, sigterm_handler)
+
+    try:
+        status_interval = 60
+        history_internal = 900
+        nextstatus = status_interval * (int(time()) // status_interval)
+        nexthistory = history_internal * ((int(time()) + history_internal) // history_internal)
+        while True:
+            try:
+                now = time()
+                wait = min(nextstatus, nexthistory) - now
+                if wait > 0:
+                    logger.debug('waiting for {0} seconds'.format(wait))
+                    sleep(wait)
+                try:
+                    livestatus = map_result(status.read())
+                    logger.debug('livestatus: {0}'.format(livestatus))
+                finally:
+                    now = time()
+                if nextstatus < now:
+                    try:
+                        display.update_status(livestatus)
+                    finally:
+                        nextstatus += status_interval
+                if nexthistory < now:
+                    try:
+                        display.update_history(livestatus)
+                    finally:
+                        nexthistory += history_internal
+            except (SystemExit, KeyboardInterrupt):
+                # silently exit the loop
+                logger.debug('got termination signal')
+                break
+            except Exception:
+                logger.exception('error in main loop')
+    finally:
+        logger.info('shutting down gracefully...')
+    logger.info('done')
+
+
+if __name__ == '__main__':
+    main()
